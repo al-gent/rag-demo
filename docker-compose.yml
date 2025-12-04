@@ -5,16 +5,30 @@ services:
       - "6333:6333"
     volumes:
       - ./qdrant_data:/qdrant/storage
-
+  
   api:
     build: .
     ports:
       - "8000:8000"
     depends_on:
       - qdrant
+      - postgres
     env_file:
       - .env
     volumes:
       - ./data:/app/data
       - ./main.py:/app/main.py 
+      - ./db:/app/db
+      - ./stats.html:/app/stats.html 
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload 
+  
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: rag_logs
+      POSTGRES_USER: rag_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
