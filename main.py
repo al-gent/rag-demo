@@ -17,6 +17,10 @@ from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import time
 
+from pydantic import BaseModel
+from typing import Optional 
+
+import requests 
 # Database setup
 Base = declarative_base()
 
@@ -59,11 +63,44 @@ class UploadLog(Base):
     success = Column(Boolean)
     error_message = Column(Text, nullable=True)
 
+# Logging API request models
+class QueryLogRequest(BaseModel):
+    query_id: str
+    rag_hardware_id: str
+    llm_hardware_id: str
+    model_name: str
+    question: str
+    answer: str
+    num_chunks_retrieved: int
+    avg_similarity_score: float
+    embedding_time_ms: float
+    vector_search_time_ms: float
+    llm_time_ms: float
+    total_time_ms: float
+    estimated_cost_usd: float
+    success: bool
+    error_message: Optional[str] = None
+
+class UploadLogRequest(BaseModel):
+    upload_id: str
+    rag_hardware_id: str
+    filename: str
+    num_chunks: int
+    file_size_bytes: int
+    text_extraction_time_ms: float
+    chunking_time_ms: float
+    embedding_time_ms: float
+    vector_store_time_ms: float
+    total_time_ms: float
+    success: bool
+    error_message: Optional[str] = None
+
 # Create database (persisted in PostgreSQL)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db/rag_logs.db")  # Fallback to SQLite for local dev
 RAG_HARDWARE_ID = os.getenv("RAG_HARDWARE_ID", "local-dev")
 LLM_HARDWARE_ID = os.getenv("LLM_HARDWARE_ID", "local-dev")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+LOG_SERVER_URL = os.getenv("LOG_SERVER_URL", None)
 
 engine = create_engine(DATABASE_URL, echo=False)
 Base.metadata.create_all(engine)
@@ -96,6 +133,23 @@ def init_collection():
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(size=384, distance=Distance.COSINE)
         )
+
+def send_log_to_server(endpoint: str, log_data: dict):
+    """Send log data to remote logging server"""
+    if not LOG_SERVER_URL:
+        return False  # No server configured
+    
+    try:
+        response = requests.post(
+            f"{LOG_SERVER_URL}{endpoint}",
+            json=log_data,
+            timeout=5
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Failed to send log to server: {e}")
+        return False
 
 init_collection()
 
@@ -144,10 +198,8 @@ def health():
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
     """Upload a PDF or TXT file and add it to the vector store"""
-    
     upload_id = str(uuid.uuid4())
     start_time = time.time()
-    db_session = SessionLocal()
     
     try:
         if not (file.filename.endswith('.pdf') or file.filename.endswith('.txt')):
@@ -195,23 +247,26 @@ async def upload_document(file: UploadFile = File(...)):
         
         total_time_ms = (time.time() - start_time) * 1000
         
-        # Log to database
-        log_entry = UploadLog(
-            upload_id=upload_id,
-            rag_hardware_id=RAG_HARDWARE_ID,
-            filename=file.filename,
-            num_chunks=len(chunks),
-            file_size_bytes=file_size_bytes,
-            text_extraction_time_ms=text_extraction_time_ms,
-            chunking_time_ms=chunking_time_ms,
-            embedding_time_ms=embedding_time_ms,
-            vector_store_time_ms=vector_store_time_ms,
-            total_time_ms=total_time_ms,
-            success=True,
-            error_message=None
-        )
-        db_session.add(log_entry)
-        db_session.commit()
+        # Log to server
+        log_data = {
+            "upload_id": upload_id,
+            "rag_hardware_id": RAG_HARDWARE_ID,
+            "filename": file.filename,
+            "num_chunks": len(chunks),
+            "file_size_bytes": file_size_bytes,
+            "text_extraction_time_ms": text_extraction_time_ms,
+            "chunking_time_ms": chunking_time_ms,
+            "embedding_time_ms": embedding_time_ms,
+            "vector_store_time_ms": vector_store_time_ms,
+            "total_time_ms": total_time_ms,
+            "success": True,
+            "error_message": None
+        }
+        
+        if not LOG_SERVER_URL:
+            print("WARNING: LOG_SERVER_URL not configured - upload not logged!")
+        elif not send_log_to_server("/api/log-upload", log_data):
+            print(f"ERROR: Failed to send upload log to {LOG_SERVER_URL}")
         
         return {
             "message": f"Uploaded {file.filename} with {len(chunks)} chunks",
@@ -227,25 +282,27 @@ async def upload_document(file: UploadFile = File(...)):
         
     except Exception as e:
         total_time_ms = (time.time() - start_time) * 1000
-        log_entry = UploadLog(
-            upload_id=upload_id,
-            rag_hardware_id=RAG_HARDWARE_ID,
-            filename=file.filename if file.filename else "unknown",
-            num_chunks=0,
-            file_size_bytes=0,
-            text_extraction_time_ms=0.0,
-            chunking_time_ms=0.0,
-            embedding_time_ms=0.0,
-            vector_store_time_ms=0.0,
-            total_time_ms=total_time_ms,
-            success=False,
-            error_message=str(e)
-        )
-        db_session.add(log_entry)
-        db_session.commit()
+        log_data = {
+            "upload_id": upload_id,
+            "rag_hardware_id": RAG_HARDWARE_ID,
+            "filename": file.filename if file.filename else "unknown",
+            "num_chunks": 0,
+            "file_size_bytes": 0,
+            "text_extraction_time_ms": 0.0,
+            "chunking_time_ms": 0.0,
+            "embedding_time_ms": 0.0,
+            "vector_store_time_ms": 0.0,
+            "total_time_ms": total_time_ms,
+            "success": False,
+            "error_message": str(e)
+        }
+        
+        if not LOG_SERVER_URL:
+            print("WARNING: LOG_SERVER_URL not configured - error not logged!")
+        elif not send_log_to_server("/api/log-upload", log_data):
+            print(f"ERROR: Failed to send error log to {LOG_SERVER_URL}")
+        
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db_session.close()
 
 @app.post("/load-documents")
 def load_documents():
@@ -290,7 +347,6 @@ def query(request: QueryRequest):
     
     query_id = str(uuid.uuid4())
     start_time = time.time()
-    db_session = SessionLocal()
     
     try:
         # 1. Embed the query
@@ -309,25 +365,29 @@ def query(request: QueryRequest):
         
         if not search_results:
             # Log failed query
-            log_entry = QueryLog(
-                query_id=query_id,
-                rag_hardware_id=RAG_HARDWARE_ID,
-                llm_hardware_id=LLM_HARDWARE_ID,
-                model_name=MODEL_NAME,
-                question=request.question,
-                answer="",
-                num_chunks_retrieved=0,
-                avg_similarity_score=0.0,
-                embedding_time_ms=embedding_time_ms,
-                vector_search_time_ms=vector_search_time_ms,
-                llm_time_ms=0.0,
-                total_time_ms=(time.time() - start_time) * 1000,
-                estimated_cost_usd=0.0,
-                success=False,
-                error_message="No relevant documents found"
-            )
-            db_session.add(log_entry)
-            db_session.commit()
+            log_data = {
+                "query_id": query_id,
+                "rag_hardware_id": RAG_HARDWARE_ID,
+                "llm_hardware_id": LLM_HARDWARE_ID,
+                "model_name": MODEL_NAME,
+                "question": request.question,
+                "answer": "",
+                "num_chunks_retrieved": 0,
+                "avg_similarity_score": 0.0,
+                "embedding_time_ms": embedding_time_ms,
+                "vector_search_time_ms": vector_search_time_ms,
+                "llm_time_ms": 0.0,
+                "total_time_ms": (time.time() - start_time) * 1000,
+                "estimated_cost_usd": 0.0,
+                "success": False,
+                "error_message": "No relevant documents found"
+            }
+            
+            if not LOG_SERVER_URL:
+                print("WARNING: LOG_SERVER_URL not configured - failed query not logged!")
+            elif not send_log_to_server("/api/log-query", log_data):
+                print(f"ERROR: Failed to send log to {LOG_SERVER_URL}")
+            
             raise HTTPException(status_code=404, detail="No relevant documents found")
         
         # 3. Build context from retrieved chunks
@@ -370,26 +430,28 @@ def query(request: QueryRequest):
         # Calculate total time
         total_time_ms = (time.time() - start_time) * 1000
         
-        # 5. Log to database
-        log_entry = QueryLog(
-            query_id=query_id,
-            rag_hardware_id=RAG_HARDWARE_ID,
-            llm_hardware_id=LLM_HARDWARE_ID,
-            model_name=MODEL_NAME,
-            question=request.question,
-            answer=answer,
-            num_chunks_retrieved=len(search_results),
-            avg_similarity_score=avg_similarity_score,
-            embedding_time_ms=embedding_time_ms,
-            vector_search_time_ms=vector_search_time_ms,
-            llm_time_ms=llm_time_ms,
-            total_time_ms=total_time_ms,
-            estimated_cost_usd=estimated_cost_usd,
-            success=True,
-            error_message=None
-        )
-        db_session.add(log_entry)
-        db_session.commit()
+        log_data = {
+            "query_id": query_id,
+            "rag_hardware_id": RAG_HARDWARE_ID,
+            "llm_hardware_id": LLM_HARDWARE_ID,
+            "model_name": MODEL_NAME,
+            "question": request.question,
+            "answer": answer,
+            "num_chunks_retrieved": len(search_results),
+            "avg_similarity_score": avg_similarity_score,
+            "embedding_time_ms": embedding_time_ms,
+            "vector_search_time_ms": vector_search_time_ms,
+            "llm_time_ms": llm_time_ms,
+            "total_time_ms": total_time_ms,
+            "estimated_cost_usd": estimated_cost_usd,
+            "success": True,
+            "error_message": None
+        }
+        
+        if not LOG_SERVER_URL:
+            print("WARNING: LOG_SERVER_URL not configured - query not logged!")
+        elif not send_log_to_server("/api/log-query", log_data):
+            print(f"ERROR: Failed to send log to {LOG_SERVER_URL}")
         
         # 6. Format sources
         sources = [
@@ -406,30 +468,32 @@ def query(request: QueryRequest):
     except HTTPException:
         raise
     except Exception as e:
-        # Log unexpected errors
-        total_time_ms = (time.time() - start_time) * 1000
-        log_entry = QueryLog(
-            query_id=query_id,
-            rag_hardware_id=RAG_HARDWARE_ID,
-            llm_hardware_id=LLM_HARDWARE_ID,
-            model_name=MODEL_NAME,
-            question=request.question,
-            answer="",
-            num_chunks_retrieved=0,
-            avg_similarity_score=0.0,
-            embedding_time_ms=0.0,
-            vector_search_time_ms=0.0,
-            llm_time_ms=0.0,
-            total_time_ms=total_time_ms,
-            estimated_cost_usd=0.0,
-            success=False,
-            error_message=str(e)
-        )
-        db_session.add(log_entry)
-        db_session.commit()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db_session.close()
+            # Log unexpected errors
+            total_time_ms = (time.time() - start_time) * 1000
+            log_data = {
+                "query_id": query_id,
+                "rag_hardware_id": RAG_HARDWARE_ID,
+                "llm_hardware_id": LLM_HARDWARE_ID,
+                "model_name": MODEL_NAME,
+                "question": request.question,
+                "answer": "",
+                "num_chunks_retrieved": 0,
+                "avg_similarity_score": 0.0,
+                "embedding_time_ms": 0.0,
+                "vector_search_time_ms": 0.0,
+                "llm_time_ms": 0.0,
+                "total_time_ms": total_time_ms,
+                "estimated_cost_usd": 0.0,
+                "success": False,
+                "error_message": str(e)
+            }
+            
+            if not LOG_SERVER_URL:
+                print("WARNING: LOG_SERVER_URL not configured - error not logged!")
+            elif not send_log_to_server("/api/log-query", log_data):
+                print(f"ERROR: Failed to send error log to {LOG_SERVER_URL}")
+            
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stats")
 def get_stats(group_by: str = "rag_hardware"):
@@ -565,3 +629,74 @@ def list_documents():
         "total_chunks": result.count,
         "collection": COLLECTION_NAME
     }
+
+
+@app.post("/api/log-query")
+def log_query_api(log_data: QueryLogRequest):
+    """Receive query log from remote RAG client"""
+    db_session = SessionLocal()
+    
+    try:
+        # Create database entry
+        log_entry = QueryLog(
+            query_id=log_data.query_id,
+            rag_hardware_id=log_data.rag_hardware_id,
+            llm_hardware_id=log_data.llm_hardware_id,
+            model_name=log_data.model_name,
+            question=log_data.question,
+            answer=log_data.answer,
+            num_chunks_retrieved=log_data.num_chunks_retrieved,
+            avg_similarity_score=log_data.avg_similarity_score,
+            embedding_time_ms=log_data.embedding_time_ms,
+            vector_search_time_ms=log_data.vector_search_time_ms,
+            llm_time_ms=log_data.llm_time_ms,
+            total_time_ms=log_data.total_time_ms,
+            estimated_cost_usd=log_data.estimated_cost_usd,
+            success=log_data.success,
+            error_message=log_data.error_message
+        )
+        
+        db_session.add(log_entry)
+        db_session.commit()
+        
+        return {"status": "success", "query_id": log_data.query_id}
+        
+    except Exception as e:
+        db_session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_session.close()
+
+
+@app.post("/api/log-upload")
+def log_upload_api(log_data: UploadLogRequest):
+    """Receive upload log from remote RAG client"""
+    db_session = SessionLocal()
+    
+    try:
+        # Create database entry
+        log_entry = UploadLog(
+            upload_id=log_data.upload_id,
+            rag_hardware_id=log_data.rag_hardware_id,
+            filename=log_data.filename,
+            num_chunks=log_data.num_chunks,
+            file_size_bytes=log_data.file_size_bytes,
+            text_extraction_time_ms=log_data.text_extraction_time_ms,
+            chunking_time_ms=log_data.chunking_time_ms,
+            embedding_time_ms=log_data.embedding_time_ms,
+            vector_store_time_ms=log_data.vector_store_time_ms,
+            total_time_ms=log_data.total_time_ms,
+            success=log_data.success,
+            error_message=log_data.error_message
+        )
+        
+        db_session.add(log_entry)
+        db_session.commit()
+        
+        return {"status": "success", "upload_id": log_data.upload_id}
+        
+    except Exception as e:
+        db_session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_session.close()

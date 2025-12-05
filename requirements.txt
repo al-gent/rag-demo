@@ -9,3 +9,4 @@ pypdf==3.17.0
 python-dotenv==1.0.0
 sqlalchemy==2.0.23
 psycopg2-binary
+requests

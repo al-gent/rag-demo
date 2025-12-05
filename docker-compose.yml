@@ -27,7 +27,7 @@ services:
     environment:
       POSTGRES_DB: rag_logs
       POSTGRES_USER: rag_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - ./postgres_data:/var/lib/postgresql/data
     ports:
