@@ -6,6 +6,22 @@ services:
     volumes:
       - ./qdrant_data:/qdrant/storage
   
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: rag_logs
+      POSTGRES_USER: rag_user
+      POSTGRES_PASSWORD: password123 
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag_user"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  
   api:
     build: .
     ports:
@@ -27,15 +43,10 @@ services:
       context: ../street_sweeping_API
     ports:
       - "8001:8000" 
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - ../street_sweeping_API/.env 
     command: uvicorn main:app --host 0.0.0.0 --port 8000
-
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: rag_logs
-      POSTGRES_USER: rag_user
-      # POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - ./postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    restart: on-failure

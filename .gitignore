@@ -7,3 +7,4 @@ node_modules/
 .next/
 data/
 db/postgres_data/
+.db
